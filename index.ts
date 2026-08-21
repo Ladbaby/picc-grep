@@ -135,7 +135,7 @@ const VCS_DIRECTORIES_TO_EXCLUDE = [
 const DESCRIPTION = `A powerful search tool built on ripgrep
 
 Usage:
-- ALWAYS use Grep for search tasks. NEVER invoke \`grep\` or \`rg\` as a Bash command. The Grep tool has been optimized for correct permissions and access.
+- ALWAYS use grep for search tasks. NEVER invoke \`grep\` or \`rg\` as a Bash command. The grep tool has been optimized for correct permissions and access.
 - Supports full regex syntax (e.g., "log.*Error", "function\\s+\\w+")
 - Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
 - Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
@@ -385,23 +385,71 @@ async function ripGrep(
 // ============================================================================
 
 const GREP_SCHEMA = Type.Object({
-	pattern: Type.String({
-		description:
-			"The regular expression pattern to search for in file contents",
-	}),
-	path: Type.Optional(
-		Type.String({
+    "-A": Type.Optional(
+        Type.Number({
+            description:
+                'Number of lines to show after each match (rg -A). Requires output_mode: "content", ignored otherwise.',
+        }),
+    ),
+	"-B": Type.Optional(
+		Type.Number({
 			description:
-				"File or directory to search in (rg PATH). Defaults to current working directory.",
+				'Number of lines to show before each match (rg -B). Requires output_mode: "content", ignored otherwise.',
 		}),
 	),
-	glob: Type.Optional(
-		Type.String({
-			description:
-				'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob',
+	"-C": Type.Optional(
+		Type.Number({
+			description: "Alias for context.",
 		}),
 	),
-	output_mode: Type.Optional(
+    "-i": Type.Optional(
+        Type.Boolean({
+            description: "Case insensitive search (rg -i)",
+        }),
+    ),
+    "-n": Type.Optional(
+        Type.Boolean({
+            description:
+                'Show line numbers in output (rg -n). Requires output_mode: "content", ignored otherwise. Defaults to true.',
+        }),
+    ),
+    "-o": Type.Optional(
+        Type.Boolean({
+            description:
+                'Print only the matched (non-empty) parts of each matching line, one match per output line (rg -o / --only-matching). Requires output_mode: "content", ignored otherwise. Defaults to false.',
+        }),
+    ),
+	context: Type.Optional(
+		Type.Number({
+			description:
+				'Number of lines to show before and after each match (rg -C). Requires output_mode: "content", ignored otherwise.',
+		}),
+	),
+    glob: Type.Optional(
+        Type.String({
+            description:
+                'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob',
+        }),
+    ),
+    head_limit: Type.Optional(
+		Type.Number({
+			description:
+				'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).',
+		}),
+	),
+    multiline: Type.Optional(
+		Type.Boolean({
+			description:
+				"Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
+		}),
+	),
+    offset: Type.Optional(
+		Type.Number({
+			description:
+				'Skip first N lines/entries before applying head_limit, equivalent to "| tail -n +N | head -N". Works across all output modes. Defaults to 0.',
+		}),
+	),
+    output_mode: Type.Optional(
 		Type.Union(
 			[
 				Type.Literal("content"),
@@ -414,68 +462,20 @@ const GREP_SCHEMA = Type.Object({
 			},
 		),
 	),
-	"-B": Type.Optional(
-		Type.Number({
-			description:
-				'Number of lines to show before each match (rg -B). Requires output_mode: "content", ignored otherwise.',
-		}),
-	),
-	"-A": Type.Optional(
-		Type.Number({
-			description:
-				'Number of lines to show after each match (rg -A). Requires output_mode: "content", ignored otherwise.',
-		}),
-	),
-	"-C": Type.Optional(
-		Type.Number({
-			description: "Alias for context.",
-		}),
-	),
-	context: Type.Optional(
-		Type.Number({
-			description:
-				'Number of lines to show before and after each match (rg -C). Requires output_mode: "content", ignored otherwise.',
-		}),
-	),
-	"-n": Type.Optional(
-		Type.Boolean({
-			description:
-				'Show line numbers in output (rg -n). Requires output_mode: "content", ignored otherwise. Defaults to true.',
-		}),
-	),
-	"-i": Type.Optional(
-		Type.Boolean({
-			description: "Case insensitive search (rg -i)",
-		}),
-	),
-	"-o": Type.Optional(
-		Type.Boolean({
-			description:
-				'Print only the matched (non-empty) parts of each matching line, one match per output line (rg -o / --only-matching). Requires output_mode: "content", ignored otherwise. Defaults to false.',
-		}),
-	),
+    path: Type.Optional(
+        Type.String({
+            description:
+                "File or directory to search in (rg PATH). Defaults to current working directory.",
+        }),
+    ),
+	pattern: Type.String({
+		description:
+			"The regular expression pattern to search for in file contents",
+	}),
 	type: Type.Optional(
 		Type.String({
 			description:
 				"File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.",
-		}),
-	),
-	head_limit: Type.Optional(
-		Type.Number({
-			description:
-				'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).',
-		}),
-	),
-	offset: Type.Optional(
-		Type.Number({
-			description:
-				'Skip first N lines/entries before applying head_limit, equivalent to "| tail -n +N | head -N". Works across all output modes. Defaults to 0.',
-		}),
-	),
-	multiline: Type.Optional(
-		Type.Boolean({
-			description:
-				"Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
 		}),
 	),
 });
