@@ -40,6 +40,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ============================================================================
@@ -385,12 +386,12 @@ async function ripGrep(
 // ============================================================================
 
 const GREP_SCHEMA = Type.Object({
-    "-A": Type.Optional(
-        Type.Number({
-            description:
-                'Number of lines to show after each match (rg -A). Requires output_mode: "content", ignored otherwise.',
-        }),
-    ),
+	"-A": Type.Optional(
+		Type.Number({
+			description:
+				'Number of lines to show after each match (rg -A). Requires output_mode: "content", ignored otherwise.',
+		}),
+	),
 	"-B": Type.Optional(
 		Type.Number({
 			description:
@@ -402,54 +403,54 @@ const GREP_SCHEMA = Type.Object({
 			description: "Alias for context.",
 		}),
 	),
-    "-i": Type.Optional(
-        Type.Boolean({
-            description: "Case insensitive search (rg -i)",
-        }),
-    ),
-    "-n": Type.Optional(
-        Type.Boolean({
-            description:
-                'Show line numbers in output (rg -n). Requires output_mode: "content", ignored otherwise. Defaults to true.',
-        }),
-    ),
-    "-o": Type.Optional(
-        Type.Boolean({
-            description:
-                'Print only the matched (non-empty) parts of each matching line, one match per output line (rg -o / --only-matching). Requires output_mode: "content", ignored otherwise. Defaults to false.',
-        }),
-    ),
+	"-i": Type.Optional(
+		Type.Boolean({
+			description: "Case insensitive search (rg -i)",
+		}),
+	),
+	"-n": Type.Optional(
+		Type.Boolean({
+			description:
+				'Show line numbers in output (rg -n). Requires output_mode: "content", ignored otherwise. Defaults to true.',
+		}),
+	),
+	"-o": Type.Optional(
+		Type.Boolean({
+			description:
+				'Print only the matched (non-empty) parts of each matching line, one match per output line (rg -o / --only-matching). Requires output_mode: "content", ignored otherwise. Defaults to false.',
+		}),
+	),
 	context: Type.Optional(
 		Type.Number({
 			description:
 				'Number of lines to show before and after each match (rg -C). Requires output_mode: "content", ignored otherwise.',
 		}),
 	),
-    glob: Type.Optional(
-        Type.String({
-            description:
-                'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob',
-        }),
-    ),
-    head_limit: Type.Optional(
+	glob: Type.Optional(
+		Type.String({
+			description:
+				'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}") - maps to rg --glob',
+		}),
+	),
+	head_limit: Type.Optional(
 		Type.Number({
 			description:
 				'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).',
 		}),
 	),
-    multiline: Type.Optional(
+	multiline: Type.Optional(
 		Type.Boolean({
 			description:
 				"Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
 		}),
 	),
-    offset: Type.Optional(
+	offset: Type.Optional(
 		Type.Number({
 			description:
 				'Skip first N lines/entries before applying head_limit, equivalent to "| tail -n +N | head -N". Works across all output modes. Defaults to 0.',
 		}),
 	),
-    output_mode: Type.Optional(
+	output_mode: Type.Optional(
 		Type.Union(
 			[
 				Type.Literal("content"),
@@ -462,12 +463,12 @@ const GREP_SCHEMA = Type.Object({
 			},
 		),
 	),
-    path: Type.Optional(
-        Type.String({
-            description:
-                "File or directory to search in (rg PATH). Defaults to current working directory.",
-        }),
-    ),
+	path: Type.Optional(
+		Type.String({
+			description:
+				"File or directory to search in (rg PATH). Defaults to current working directory.",
+		}),
+	),
 	pattern: Type.String({
 		description:
 			"The regular expression pattern to search for in file contents",
@@ -683,9 +684,10 @@ async function filesWithMatches(
 	if (relativeMatches.length === 0) {
 		return "No files found";
 	}
-	return `Found ${relativeMatches.length} ${plural(relativeMatches.length, "file")}${
-		limitInfo ? ` ${limitInfo}` : ""
-	}\n${relativeMatches.join("\n")}`;
+	const pagination = limitInfo
+		? `\n\n[Showing results with pagination = ${limitInfo}]`
+		: "";
+	return `Found ${relativeMatches.length} ${plural(relativeMatches.length, "file")}\n${relativeMatches.join("\n")}${pagination}`;
 }
 
 function contentMode(
@@ -832,6 +834,9 @@ export default function (pi: ExtensionAPI): void {
 		description: DESCRIPTION,
 		promptSnippet: "Search file contents with regex (ripgrep)",
 		parameters: GREP_SCHEMA,
+		// Inherit the framework's colored result shell (pending/success/error
+		// background) rather than self-framing.
+		renderShell: "default",
 		async execute(
 			_toolCallId,
 			params,
@@ -850,17 +855,45 @@ export default function (pi: ExtensionAPI): void {
 					},
 				};
 			} catch (err) {
+				// pi's agent loop only flags a tool result as errored when execute()
+				// rejects — a resolved `{ isError: true }` is dropped because
+				// AgentToolResult has no such field. Throw so the failure is surfaced
+				// as a real tool error (matching picc-edit). Keep the human-readable
+				// prefix the model previously saw.
 				const message = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `Grep search failed: ${message}` }],
-					isError: true,
-					details: {
-						pattern: params.pattern,
-						path: params.path ?? undefined,
-						output_mode: params.output_mode ?? "files_with_matches",
-					},
-				};
+				throw new Error(`Grep search failed: ${message}`);
 			}
+		},
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) {
+				return new Text(theme.fg("warning", "Searching..."), 0, 0);
+			}
+			const t =
+				(context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			const text = result.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			// A custom renderResult replaces the framework's default content display,
+			// so we render the match/error text ourselves.
+			if (context.isError) {
+				t.setText(theme.fg("error", text || "Grep search failed"));
+				return t;
+			}
+			// Faithful to Claude Code / pi built-ins: the result body uses the
+			// neutral tool-output color; only the pagination footer is highlighted.
+			const footerPrefix = "[Showing results with pagination = ";
+			const footerIndex = text.lastIndexOf(footerPrefix);
+			if (footerIndex !== -1 && text.endsWith("]")) {
+				const body = text.slice(0, footerIndex);
+				const footer = text.slice(footerIndex);
+				t.setText(
+					`${theme.fg("toolOutput", body)}\n${theme.fg("warning", footer)}`,
+				);
+				return t;
+			}
+			t.setText(theme.fg("toolOutput", text));
+			return t;
 		},
 	});
 }
