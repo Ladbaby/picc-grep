@@ -352,10 +352,7 @@ async function ripGrep(
 	target: string,
 	abortSignal: AbortSignal,
 ): Promise<string[]> {
-	const defaultTimeout = isWsl() ? 60_000 : 20_000;
-	const parsedSeconds =
-		parseInt(process.env.PI_GREP_TIMEOUT_SECONDS ?? "", 10) || 0;
-	const timeoutMs = parsedSeconds > 0 ? parsedSeconds * 1000 : defaultTimeout;
+	const timeoutMs = isWsl() ? 60_000 : 20_000;
 
 	const run = async (singleThread: boolean): Promise<RipgrepOutcome> =>
 		runRipgrepOnce(args, target, abortSignal, timeoutMs, singleThread);
@@ -713,6 +710,8 @@ function contentMode(
 	});
 
 	const resultContent = finalLines.join("\n") || "No matches found";
+	// Nothing to paginate when the offset skipped past all results.
+	if (items.length === 0) return resultContent;
 	const limitInfo = formatLimitInfo(
 		appliedLimit,
 		offset > 0 ? offset : undefined,
@@ -759,9 +758,13 @@ function countMode(
 		offset > 0 ? offset : undefined,
 	);
 	const rawContent = finalCountLines.join("\n") || "No matches found";
-	const summary = `\n\nFound ${totalMatches} total ${plural(totalMatches, "occurrence")} across ${fileCount} ${plural(fileCount, "file")}.${
-		limitInfo ? ` with pagination = ${limitInfo}` : ""
-	}`;
+	// Skip the summary (and its pagination suffix) when nothing matched.
+	const summary =
+		finalCountLines.length === 0
+			? ""
+			: `\n\nFound ${totalMatches} total ${plural(totalMatches, "occurrence")} across ${fileCount} ${plural(fileCount, "file")}.${
+					limitInfo ? ` with pagination = ${limitInfo}` : ""
+				}`;
 	return rawContent + summary;
 }
 

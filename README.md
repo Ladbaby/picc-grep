@@ -35,7 +35,6 @@ Install via `pi install npm:@ladbabynpm/picc-grep`.
 | `toolName` | `config.json` | `"grep"` \| `"Grep"` | `"grep"` |
 | `PICC_GREP_TOOL_NAME` | env | `"grep"` \| `"Grep"` | — |
 | `PICC_GREP_CONFIG_PATH` | env | absolute path to a config.json | sibling of `index.ts` |
-| `PI_GREP_TIMEOUT_SECONDS` | env | timeout in seconds | 20 (60 on WSL) |
 
 Precedence for the tool name: `PICC_GREP_TOOL_NAME` env > `config.json` > `"grep"`.
 
