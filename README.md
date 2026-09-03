@@ -5,7 +5,7 @@ Claude Code-style **Grep** (content search) tool for [pi](https://pi.dev) — a 
 Part of [picc](https://github.com/Ladbaby/picc), a pi agent setup mirroring Claude Code's harness.
 
 > pi's built-in `grep` always uses `--json` content mode, has no output modes and no
-> multiline support, so it is *not* a faithful port of Claude Code. This extension
+> multiline support. This extension
 > replicates Claude Code's `Grep` exactly: three output modes, rich flags, and
 > `head_limit`/`offset` pagination.
 
