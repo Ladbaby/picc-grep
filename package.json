@@ -1,53 +1,53 @@
 {
-	"name": "@ladbabynpm/picc-grep",
-	"version": "0.1.0",
-	"description": "Claude Code style Grep (content search) tool for pi — a faithful port backed by ripgrep.",
-	"type": "module",
-	"main": "index.ts",
-	"keywords": [
-		"pi",
-		"pi-package",
-		"pi-extension",
-		"grep",
-		"search",
-		"ripgrep",
-		"claude-code"
-	],
-	"license": "MIT",
-	"author": "ladbabynpm",
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/Ladbaby/picc-grep.git"
-	},
-	"homepage": "https://github.com/Ladbaby/picc-grep",
-	"bugs": {
-		"url": "https://github.com/Ladbaby/picc-grep/issues"
-	},
-	"files": [
-		"index.ts",
-		"README.md",
-		"LICENSE"
-	],
-	"pi": {
-		"extensions": [
-			"./index.ts"
-		]
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*",
-		"typebox": "*"
-	},
-	"scripts": {
-		"lint": "biome check index.ts",
-		"lint:fix": "biome check --write index.ts",
-		"typecheck": "tsc --noEmit"
-	},
-	"devDependencies": {
-		"@biomejs/biome": "^2.5.5",
-		"@types/node": "^24.0.0"
-	},
-	"publishConfig": {
-		"access": "public"
-	}
+  "name": "@ladbabynpm/picc-grep",
+  "version": "0.1.0",
+  "description": "Claude Code style Grep (content search) tool for pi — a faithful port backed by ripgrep.",
+  "type": "module",
+  "main": "index.ts",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "grep",
+    "search",
+    "ripgrep",
+    "claude-code"
+  ],
+  "license": "MIT",
+  "author": "ladbabynpm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ladbaby/picc-grep.git"
+  },
+  "homepage": "https://github.com/Ladbaby/picc-grep",
+  "bugs": {
+    "url": "https://github.com/Ladbaby/picc-grep/issues"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "lint": "biome check index.ts",
+    "lint:fix": "biome check --write index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.5",
+    "@types/node": "^24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }
