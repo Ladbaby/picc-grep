@@ -1,6 +1,8 @@
 # picc-grep
 
-Claude Code-style **Grep** (content search) tool for [pi](https://pi.dev) — a faithful port of Claude Code's `Grep` tool, backed by **ripgrep**.
+[![npm downloads](https://img.shields.io/npm/dt/@ladbabynpm/picc-grep.svg)](https://www.npmjs.com/package/@ladbabynpm/picc-grep)
+
+Claude Code style **Grep** (content search) tool for [pi](https://pi.dev) — a faithful port of Claude Code's `Grep` tool, backed by **ripgrep**.
 
 Part of [picc](https://github.com/Ladbaby/picc), a pi agent setup mirroring Claude Code's harness.
 
@@ -54,9 +56,3 @@ default.
 No `any`; top-level imports only; strict TypeScript (ES2022, bundler resolution).
 Dependencies beyond `node:*` are limited to `typebox` and
 `@earendil-works/pi-coding-agent` (both bundled with pi).
-
-## References
-
-- Claude Code `Grep` tool: `replications/claude-code/tools/GrepTool/GrepTool.ts`
-- Claude Code ripgrep: `replications/claude-code/utils/ripgrep.ts`
-- Claude Code path helpers: `replications/claude-code/utils/path.ts`
