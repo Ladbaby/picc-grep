@@ -9,10 +9,6 @@
  * `--max-columns 500`, VCS-dir excludes, and per-mode result templates with
  * path relativization against cwd.
  *
- * The `-o` (only-matching) parameter is a deliberate extension: it is present
- * in the local `Grep_schema.json` but not in Claude Code's live source. When set
- * (content mode only) it maps to `rg -o` / `--only-matching`.
- *
  * Omitted from the live source (no pi equivalent, same as picc-glob):
  *   - permission-based ignore patterns (`getFileReadIgnorePatterns`)
  *   - orphaned plugin-cache exclusions (`getGlobExclusionsForPluginCache`)
@@ -24,11 +20,6 @@
  *     `PICC_GREP_TOOL_NAME=Grep`. Valid values: `"grep"`, `"Grep"`.
  *
  * Requires `rg` (ripgrep) on PATH.
- *
- * References:
- * - Claude Code Grep tool: tools/GrepTool/GrepTool.ts (+ prompt.ts, UI.tsx)
- * - Claude Code ripgrep: utils/ripgrep.ts
- * - Claude Code path helpers: utils/path.ts
  */
 
 import { spawn } from "node:child_process";
@@ -113,13 +104,10 @@ function loadToolName(): ToolName {
 // Constants
 // ============================================================================
 
-/** Mirrors Claude Code `DEFAULT_HEAD_LIMIT` (GrepTool.ts). */
 const DEFAULT_HEAD_LIMIT = 250;
 
-/** Mirrors Claude Code `utils/ripgrep.ts` MAX_BUFFER_SIZE (20 MB). */
 const MAX_BUFFER_SIZE = 20_000_000;
 
-/** Mirrors Claude Code `VCS_DIRECTORIES_TO_EXCLUDE` (GrepTool.ts). */
 const VCS_DIRECTORIES_TO_EXCLUDE = [
 	".git",
 	".svn",
@@ -130,8 +118,7 @@ const VCS_DIRECTORIES_TO_EXCLUDE = [
 ] as const;
 
 /**
- * Tool description — verbatim from Claude Code `tools/GrepTool/prompt.ts`
- * (`Grep_description.md`).
+ * Tool description
  */
 const DESCRIPTION = `A powerful search tool built on ripgrep
 
@@ -147,7 +134,7 @@ Usage:
 type OutputMode = "content" | "files_with_matches" | "count";
 
 // ============================================================================
-// Path helpers (ports of claude-code utils/path.ts)
+// Path helpers
 // ============================================================================
 
 function isWindows(): boolean {
@@ -163,7 +150,7 @@ function isWsl(): boolean {
 }
 
 /**
- * Port of claude-code `expandPath(path, baseDir)`. Handles `~`, POSIX-style
+ * Handles `~`, POSIX-style
  * Windows paths (`/c/Users/...`), and relative→absolute resolution.
  */
 function posixPathToWindowsPath(posixPath: string): string {
@@ -191,7 +178,7 @@ function expandPath(input: string, baseDir: string): string {
 }
 
 /**
- * Port of claude-code `toRelativePath`: relativize against cwd, keeping the
+ * relativize against cwd, keeping the
  * absolute path when it would escape cwd (starts with `..`).
  */
 function toRelativePath(absolutePath: string, cwd: string): string {
@@ -218,7 +205,7 @@ function resolveRgPath(p: string, searchDir: string): string {
 }
 
 // ============================================================================
-// Ripgrep execution (port of claude-code utils/ripgrep.ts, shared w/ picc-glob)
+// Ripgrep execution
 // ============================================================================
 
 function isEagainError(stderr: string): boolean {
@@ -379,7 +366,7 @@ async function ripGrep(
 }
 
 // ============================================================================
-// Tool parameters (schema from Grep_schema.json, incl. the extra `-o`)
+// Tool parameters
 // ============================================================================
 
 const GREP_SCHEMA = Type.Object({
@@ -497,7 +484,7 @@ type GrepParams = {
 };
 
 // ============================================================================
-// Result formatting helpers (ports of GrepTool.ts)
+// Result formatting helpers
 // ============================================================================
 
 function plural(n: number, word: string): string {
@@ -537,7 +524,7 @@ function applyHeadLimit<T>(
 }
 
 // ============================================================================
-// Ripgrep arg construction (faithful to GrepTool.ts call())
+// Ripgrep arg construction
 // ============================================================================
 
 /**
