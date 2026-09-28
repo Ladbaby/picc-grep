@@ -674,6 +674,50 @@ async function filesWithMatches(
 	return `Found ${relativeMatches.length} ${plural(relativeMatches.length, "file")}\n${relativeMatches.join("\n")}${pagination}`;
 }
 
+/**
+ * Split a ripgrep content-mode output line (`path:line:content` for matches
+ * or `path-line-content` for context) into the file path and the remainder.
+ *
+ * Content can itself contain `:N:` / `-N-` sequences (timestamps, dashed
+ * numbers), so a single "last colon" or "first boundary" split is unsafe.
+ * Instead, enumerate every candidate `[:\-]<digits>[:\-]` boundary and use
+ * the earliest one whose path resolves to an existing file. Returns
+ * `undefined` when no candidate resolves (e.g. bare `line:content` output
+ * from a single-file search, `-o` output, or a deleted file), letting the
+ * caller pass the line through untouched.
+ */
+function parseContentLinePath(
+	line: string,
+	searchDir: string,
+	cwd: string,
+): { path: string; rest: string } | undefined {
+	const re = /[-:](\d+)([-:])/g;
+	let match = re.exec(line);
+	while (match !== null) {
+		if (match.index > 0) {
+			const rawPath = line.substring(0, match.index);
+			const resolved = resolveRgPath(rawPath, searchDir);
+			if (fileExists(resolved)) {
+				return {
+					path: toRelativePath(resolved, cwd),
+					rest: line.substring(match.index),
+				};
+			}
+		}
+		match = re.exec(line);
+	}
+	return undefined;
+}
+
+/** `existsSync` that never throws (odd path characters on some platforms). */
+function fileExists(p: string): boolean {
+	try {
+		return existsSync(p);
+	} catch {
+		return false;
+	}
+}
+
 function contentMode(
 	results: string[],
 	searchDir: string,
@@ -684,17 +728,30 @@ function contentMode(
 ): string {
 	const { items, appliedLimit } = applyHeadLimit(results, head_limit, offset);
 
-	const finalLines = items.map((line) => {
+	const finalLines: string[] = [];
+	let previousPath: string | undefined;
+	for (const line of items) {
 		// With -o, rg emits bare matches (no `path:` prefix) — keep as-is.
-		if (onlyMatching) return line;
-		const colonIndex = line.indexOf(":");
-		if (colonIndex > 0) {
-			const filePath = line.substring(0, colonIndex);
-			const rest = line.substring(colonIndex);
-			return toRelativePath(resolveRgPath(filePath, searchDir), cwd) + rest;
+		if (onlyMatching) {
+			finalLines.push(line);
+			continue;
 		}
-		return line;
-	});
+		// rg emits a bare `--` between file groups; drop it since the file
+		// header below marks the grouping instead.
+		if (line === "--") continue;
+		const parsed = parseContentLinePath(line, searchDir, cwd);
+		if (!parsed) {
+			finalLines.push(line);
+			previousPath = undefined;
+			continue;
+		}
+		const lineNumberAndContent = parsed.rest.slice(1);
+		if (parsed.path !== previousPath) {
+			finalLines.push(parsed.path);
+			previousPath = parsed.path;
+		}
+		finalLines.push(`${lineNumberAndContent}`);
+	}
 
 	const resultContent = finalLines.join("\n") || "No matches found";
 	// Nothing to paginate when the offset skipped past all results.
@@ -753,6 +810,37 @@ function countMode(
 					limitInfo ? ` with pagination = ${limitInfo}` : ""
 				}`;
 	return rawContent + summary;
+}
+
+// ============================================================================
+// Result rendering helpers
+// ============================================================================
+
+/**
+ * Dim the ripgrep line-number column of a content-mode body so the numbers
+ * recede behind the match text — mirroring how picc-write renders its line
+ * numbers (`dim` on the gutter, default color on the content).
+ *
+ * ripgrep emits:
+ *   - `path:line:content` / bare `line:content` for a match
+ *   - `path-line` / bare `line-content` for a context (non-match) line
+ * so the number is delimited by `:` or `-` at the head of each line. A number
+ * is only dimmed when followed by `:` or `-`, which keeps real content like
+ * `100%` / `a-b` (no leading separator) untouched.
+ */
+function dimLineNumbers(
+	body: string,
+	theme: { fg: (c: "dim", t: string) => string },
+): string {
+	return body
+		.split("\n")
+		.map((line) =>
+			line.replace(
+				/^(\d+)([:-](\d+:)?.*)$/,
+				(_m, num: string, rest: string) => `${theme.fg("dim", num)}${rest}`,
+			),
+		)
+		.join("\n");
 }
 
 // ============================================================================
@@ -842,6 +930,7 @@ export default function (pi: ExtensionAPI): void {
 						pattern: params.pattern,
 						path: params.path ?? undefined,
 						output_mode: params.output_mode ?? "files_with_matches",
+						only_matching: params["-o"] ?? false,
 					},
 				};
 			} catch (err) {
@@ -870,19 +959,36 @@ export default function (pi: ExtensionAPI): void {
 				t.setText(theme.fg("error", text || "Grep search failed"));
 				return t;
 			}
+			// Content mode with line numbers: dim the ripgrep gutter numbers so the
+			// match text stands out (mirrors picc-write's dimmed line numbers).
+			// Skipped for `-o` (bare matches, no `path:line` shape).
+			const details = result.details as
+				| { output_mode?: string; only_matching?: boolean }
+				| undefined;
+			const dimNumbers =
+				details?.output_mode === "content" &&
+				details.only_matching !== true &&
+				text !== "No matches found";
 			// Faithful to Claude Code / pi built-ins: the result body uses the
 			// neutral tool-output color; only the pagination footer is highlighted.
 			const footerPrefix = "[Showing results with pagination = ";
 			const footerIndex = text.lastIndexOf(footerPrefix);
-			if (footerIndex !== -1 && text.endsWith("]")) {
-				const body = text.slice(0, footerIndex);
-				const footer = text.slice(footerIndex);
+			// Split off the footer before dimming: dimLineNumbers injects ANSI
+			// escapes, so it must run on a stable string, not one we index into.
+			const rawBody =
+				footerIndex !== -1 && text.endsWith("]")
+					? text.slice(0, footerIndex)
+					: text;
+			const footer =
+				footerIndex !== -1 && text.endsWith("]") ? text.slice(footerIndex) : "";
+			const dimmedBody = dimNumbers ? dimLineNumbers(rawBody, theme) : rawBody;
+			if (footer) {
 				t.setText(
-					`${theme.fg("toolOutput", body)}\n${theme.fg("warning", footer)}`,
+					`${theme.fg("toolOutput", dimmedBody)}\n${theme.fg("warning", footer)}`,
 				);
 				return t;
 			}
-			t.setText(theme.fg("toolOutput", text));
+			t.setText(theme.fg("toolOutput", dimmedBody));
 			return t;
 		},
 	});
