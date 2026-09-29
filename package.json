@@ -1,6 +1,6 @@
 {
   "name": "@ladbabynpm/picc-grep",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Code style Grep (content search) tool for pi — a faithful port backed by ripgrep.",
   "type": "module",
   "main": "index.ts",
