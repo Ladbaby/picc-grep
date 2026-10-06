@@ -9,9 +9,22 @@
  * `--max-columns 500`, VCS-dir excludes, and per-mode result templates with
  * path relativization against cwd.
  *
- * Omitted from the live source (no pi equivalent, same as picc-glob):
- *   - permission-based ignore patterns (`getFileReadIgnorePatterns`)
- *   - orphaned plugin-cache exclusions (`getGlobExclusionsForPluginCache`)
+ * Tool-result text is byte-for-byte Claude Code's: content mode rewrites the
+ * path in place on every ripgrep line (`relpath:num:content`, `relpath-num-content`
+ * for context lines, `--` group separators preserved), files_with_matches and
+ * count carry their `limit: N` inside the summary sentence rather than a
+ * trailing footer, and a missing `path` fails with
+ * `Path does not exist: <path>. Note: your current working directory is <cwd>.`
+ * plus a `Did you mean …?` hint.
+ *
+ * Deviations from the live source, all deliberate:
+ *   - the `-o` (only-matching) parameter is an extension (present in the local
+ *     `Grep_schema.json`, absent from Claude Code's live source)
+ *   - the path/content boundary is verified against the filesystem
+ *     (`parseContentLinePath`) instead of `line.indexOf(':')`
+ *   - permission-based ignore patterns (`getFileReadIgnorePatterns`) and
+ *     orphaned plugin-cache exclusions (`getGlobExclusionsForPluginCache`) are
+ *     omitted — no pi equivalent, same as picc-glob
  *
  * Tool name configuration:
  *   - Default: `"grep"` (lowercase; Claude Code's actual name is `"Grep"`).
@@ -24,9 +37,18 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	normalize,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -202,6 +224,54 @@ function resolveRgPath(p: string, searchDir: string): string {
 	if (isAbsolute(p)) return normalize(p);
 	if (p.startsWith(searchDir)) return normalize(p.slice(searchDir.length));
 	return normalize(join(searchDir, p));
+}
+
+/**
+ * Port of Claude Code's `suggestPathUnderCwd` (`utils/file.ts`): a missing path
+ * that lives *next to* cwd (a sibling directory of the current project) usually
+ * means the same relative path under cwd was intended — return that candidate
+ * when it exists, else `undefined`.
+ *
+ * `cwd` is threaded in rather than read from a global, since pi hands it to
+ * `execute()` per call.
+ */
+async function suggestPathUnderCwd(
+	requestedPath: string,
+	cwd: string,
+): Promise<string | undefined> {
+	const cwdParent = dirname(cwd);
+
+	// Resolve symlinks in the requested path's parent directory (e.g. /tmp ->
+	// /private/tmp on macOS) so the prefix comparison works against `cwd`,
+	// which is already realpath-resolved.
+	let resolvedPath = requestedPath;
+	try {
+		const resolvedDir = await realpath(dirname(requestedPath));
+		resolvedPath = join(resolvedDir, basename(requestedPath));
+	} catch {
+		// Parent directory doesn't exist — use the original path.
+	}
+
+	// Only check when the requested path is under cwd's parent but not under
+	// cwd itself. When cwd's parent is the root, use it directly as the prefix
+	// to avoid a double separator that would never match.
+	const cwdParentPrefix = cwdParent === sep ? sep : cwdParent + sep;
+	if (
+		!resolvedPath.startsWith(cwdParentPrefix) ||
+		resolvedPath.startsWith(cwd + sep) ||
+		resolvedPath === cwd
+	) {
+		return undefined;
+	}
+
+	// Same relative path, but rooted at cwd.
+	const correctedPath = join(cwd, relative(cwdParent, resolvedPath));
+	try {
+		await stat(correctedPath);
+		return correctedPath;
+	} catch {
+		return undefined;
+	}
 }
 
 // ============================================================================
@@ -661,6 +731,9 @@ async function filesWithMatches(
 	const { items, appliedLimit } = applyHeadLimit(sorted, head_limit, offset);
 	const relativeMatches = items.map((p) => toRelativePath(p, cwd));
 
+	// head_limit/offset were already applied above, so show exactly what is in
+	// hand — and carry `limit: N` on the summary line (GrepTool's
+	// mapToolResultToToolResultBlockParam), not as a trailing footer.
 	const limitInfo = formatLimitInfo(
 		appliedLimit,
 		offset > 0 ? offset : undefined,
@@ -668,10 +741,7 @@ async function filesWithMatches(
 	if (relativeMatches.length === 0) {
 		return "No files found";
 	}
-	const pagination = limitInfo
-		? `\n\n[Showing results with pagination = ${limitInfo}]`
-		: "";
-	return `Found ${relativeMatches.length} ${plural(relativeMatches.length, "file")}\n${relativeMatches.join("\n")}${pagination}`;
+	return `Found ${relativeMatches.length} ${plural(relativeMatches.length, "file")}${limitInfo ? ` ${limitInfo}` : ""}\n${relativeMatches.join("\n")}`;
 }
 
 /**
@@ -718,6 +788,18 @@ function fileExists(p: string): boolean {
 	}
 }
 
+/**
+ * Content mode: one output line per ripgrep line, with the path relativized in
+ * place — `relpath:num:content` for a match, `relpath-num-content` for a
+ * context line (`-A`/`-B`/`-C`). This mirrors `GrepTool.call`, which does
+ * `toRelativePath(filePath) + rest` per line and leaves everything else
+ * (ripgrep's `--` group separators, path-less lines from a single-file target)
+ * untouched.
+ *
+ * The path boundary is located with `parseContentLinePath` (which checks that
+ * the candidate path exists) instead of `line.indexOf(':')`, so a Windows drive
+ * letter or a `:N:` inside the content cannot be mistaken for the boundary.
+ */
 function contentMode(
 	results: string[],
 	searchDir: string,
@@ -728,30 +810,14 @@ function contentMode(
 ): string {
 	const { items, appliedLimit } = applyHeadLimit(results, head_limit, offset);
 
-	const finalLines: string[] = [];
-	let previousPath: string | undefined;
-	for (const line of items) {
+	const finalLines = items.map((line) => {
 		// With -o, rg emits bare matches (no `path:` prefix) — keep as-is.
-		if (onlyMatching) {
-			finalLines.push(line);
-			continue;
-		}
-		// rg emits a bare `--` between file groups; drop it since the file
-		// header below marks the grouping instead.
-		if (line === "--") continue;
+		if (onlyMatching) return line;
 		const parsed = parseContentLinePath(line, searchDir, cwd);
-		if (!parsed) {
-			finalLines.push(line);
-			previousPath = undefined;
-			continue;
-		}
-		const lineNumberAndContent = parsed.rest.slice(1);
-		if (parsed.path !== previousPath) {
-			finalLines.push(parsed.path);
-			previousPath = parsed.path;
-		}
-		finalLines.push(`${lineNumberAndContent}`);
-	}
+		// `rest` starts at the `:`/`-` delimiter, so path + rest rebuilds the
+		// ripgrep line with only the path rewritten.
+		return parsed ? parsed.path + parsed.rest : line;
+	});
 
 	const resultContent = finalLines.join("\n") || "No matches found";
 	// Nothing to paginate when the offset skipped past all results.
@@ -802,13 +868,11 @@ function countMode(
 		offset > 0 ? offset : undefined,
 	);
 	const rawContent = finalCountLines.join("\n") || "No matches found";
-	// Skip the summary (and its pagination suffix) when nothing matched.
-	const summary =
-		finalCountLines.length === 0
-			? ""
-			: `\n\nFound ${totalMatches} total ${plural(totalMatches, "occurrence")} across ${fileCount} ${plural(fileCount, "file")}.${
-					limitInfo ? ` with pagination = ${limitInfo}` : ""
-				}`;
+	// The summary is always present in count mode (Claude Code appends it even
+	// for zero matches: "Found 0 total occurrences across 0 files.").
+	const summary = `\n\nFound ${totalMatches} total ${plural(totalMatches, "occurrence")} across ${fileCount} ${plural(fileCount, "file")}.${
+		limitInfo ? ` with pagination = ${limitInfo}` : ""
+	}`;
 	return rawContent + summary;
 }
 
@@ -821,12 +885,16 @@ function countMode(
  * recede behind the match text — mirroring how picc-write renders its line
  * numbers (`dim` on the gutter, default color on the content).
  *
- * ripgrep emits:
- *   - `path:line:content` / bare `line:content` for a match
- *   - `path-line` / bare `line-content` for a context (non-match) line
- * so the number is delimited by `:` or `-` at the head of each line. A number
- * is only dimmed when followed by `:` or `-`, which keeps real content like
- * `100%` / `a-b` (no leading separator) untouched.
+ * ripgrep emits `path:line:content` / `path-line-content` for a match/context
+ * line, and the path-less `line:content` / `line-content` for a single-file
+ * target — so the line number is the first `(\d+)` run followed by `:` or `-`.
+ * Paths can themselves contain digits (`v2-a.ts`), which would make the first
+ * such run ambiguous, so the number is dimmed only when no digit precedes it on
+ * the line: a path with digits loses its gutter dim rather than risk dimming a
+ * span inside the path.
+ *
+ * Only called when the output actually has a line-number column (`-n`, the
+ * default), so content digits are never candidates.
  */
 function dimLineNumbers(
 	body: string,
@@ -836,8 +904,9 @@ function dimLineNumbers(
 		.split("\n")
 		.map((line) =>
 			line.replace(
-				/^(\d+)([:-](\d+:)?.*)$/,
-				(_m, num: string, rest: string) => `${theme.fg("dim", num)}${rest}`,
+				/^([^\d]*)(\d+)([-:].*)$/,
+				(_m, prefix: string, num: string, rest: string) =>
+					`${prefix}${theme.fg("dim", num)}${rest}`,
 			),
 		)
 		.join("\n");
@@ -873,7 +942,14 @@ async function executeGrep(
 				exists = false;
 			}
 			if (!exists) {
-				throw new Error(`Directory does not exist: ${params.path}. ${cwd}.`);
+				// Port of GrepTool.validateInput's ENOENT message, which is
+				// `Path does not exist: <path>. ${FILE_NOT_FOUND_CWD_NOTE} <cwd>.`
+				// plus a `Did you mean …?` hint when the same relative path
+				// exists directly under cwd.
+				let message = `Path does not exist: ${params.path}. Note: your current working directory is ${cwd}.`;
+				const suggestion = await suggestPathUnderCwd(dir, cwd);
+				if (suggestion) message += ` Did you mean ${suggestion}?`;
+				throw new Error(message);
 			}
 		}
 	}
@@ -931,6 +1007,7 @@ export default function (pi: ExtensionAPI): void {
 						path: params.path ?? undefined,
 						output_mode: params.output_mode ?? "files_with_matches",
 						only_matching: params["-o"] ?? false,
+						line_numbers: params["-n"] ?? true,
 					},
 				};
 			} catch (err) {
@@ -961,13 +1038,19 @@ export default function (pi: ExtensionAPI): void {
 			}
 			// Content mode with line numbers: dim the ripgrep gutter numbers so the
 			// match text stands out (mirrors picc-write's dimmed line numbers).
-			// Skipped for `-o` (bare matches, no `path:line` shape).
+			// Skipped for `-o` (bare matches, no `path:line` shape) and for
+			// `-n: false` (no gutter — digits in the content are not line numbers).
 			const details = result.details as
-				| { output_mode?: string; only_matching?: boolean }
+				| {
+						output_mode?: string;
+						only_matching?: boolean;
+						line_numbers?: boolean;
+				  }
 				| undefined;
 			const dimNumbers =
 				details?.output_mode === "content" &&
 				details.only_matching !== true &&
+				details.line_numbers !== false &&
 				text !== "No matches found";
 			// Faithful to Claude Code / pi built-ins: the result body uses the
 			// neutral tool-output color; only the pagination footer is highlighted.
