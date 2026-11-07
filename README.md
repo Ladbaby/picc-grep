@@ -42,7 +42,26 @@ Install via `pi install npm:@ladbabynpm/picc-grep`.
   - permission-based read-ignore patterns (`getFileReadIgnorePatterns`) and orphaned
     plugin-cache exclusions (`getGlobExclusionsForPluginCache`) are omitted — they have no
     pi equivalent (same as picc-glob).
-- Requires `rg` (ripgrep) on `PATH`.
+
+## Ripgrep resolution
+
+`rg` is resolved in this order, and downloaded automatically when it is missing
+anywhere — no manual install needed:
+
+1. `PICC_GREP_RG_PATH` — an explicit binary path (must exist, else the call fails).
+2. `~/.pi/agent/bin/rg` (`rg.exe` on Windows) — the directory pi's own tools-manager
+   uses, so one download serves pi's built-in tools and this one. Honors
+   `PI_CODING_AGENT_DIR`.
+3. `rg` on `PATH`.
+4. Download the latest official [BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep)
+   release into `~/.pi/agent/bin` and use it. The download is announced in the tool's
+   partial result and the footer status line, runs once per process (concurrent calls
+   share it), and is retried on the next call if it fails. Archives are extracted with
+   `tar`/`unzip` (`System32\tar.exe` then PowerShell `Expand-Archive` on Windows).
+
+`PI_OFFLINE=1` (or `true`/`yes`) disables the download, matching pi's own behavior. On
+Android/Termux the tool asks for `pkg install ripgrep` instead, since the official Linux
+binaries don't run on Bionic libc.
 
 ## Configuration
 
@@ -51,6 +70,8 @@ Install via `pi install npm:@ladbabynpm/picc-grep`.
 | `toolName` | `config.json` | `"grep"` \| `"Grep"` | `"grep"` |
 | `PICC_GREP_TOOL_NAME` | env | `"grep"` \| `"Grep"` | — |
 | `PICC_GREP_CONFIG_PATH` | env | absolute path to a config.json | sibling of `index.ts` |
+| `PICC_GREP_RG_PATH` | env | absolute path to an `rg` binary | — |
+| `PI_OFFLINE` | env | `1` \| `true` \| `yes` disables the `rg` download | — |
 
 Precedence for the tool name: `PICC_GREP_TOOL_NAME` env > `config.json` > `"grep"`.
 

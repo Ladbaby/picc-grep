@@ -32,13 +32,27 @@
  *     `~/.pi/agent/extensions/picc-grep/config.json`), or set
  *     `PICC_GREP_TOOL_NAME=Grep`. Valid values: `"grep"`, `"Grep"`.
  *
- * Requires `rg` (ripgrep) on PATH.
+ * Ripgrep resolution: the tool uses `rg` from `~/.pi/agent/bin` (where pi
+ * caches its own tool downloads) or from PATH, and — matching pi's built-in
+ * grep/find tools — downloads the official BurntSushi release into that bin
+ * directory when `rg` is missing entirely. Set `PI_OFFLINE=1` to opt out.
  */
 
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { realpath, stat } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { arch, homedir, platform } from "node:os";
 import {
 	basename,
 	dirname,
@@ -49,9 +63,10 @@ import {
 	resolve,
 	sep,
 } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
+import {
+	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -129,6 +144,9 @@ function loadToolName(): ToolName {
 const DEFAULT_HEAD_LIMIT = 250;
 
 const MAX_BUFFER_SIZE = 20_000_000;
+
+/** Sent as the GitHub User-Agent; the API rejects requests without one. */
+const RIPGREP_USER_AGENT = "picc-grep";
 
 const VCS_DIRECTORIES_TO_EXCLUDE = [
 	".git",
@@ -275,6 +293,406 @@ async function suggestPathUnderCwd(
 }
 
 // ============================================================================
+// Ripgrep resolution (override → pi bin dir → PATH → auto-download)
+// ============================================================================
+
+const RIPGREP_REPO = "BurntSushi/ripgrep";
+
+const RIPGREP_VERSION_TIMEOUT_MS = 10_000;
+
+const RIPGREP_DOWNLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * `~/.pi/agent/bin` — the same directory pi's own tools-manager uses, so a
+ * single downloaded `rg` serves both pi's built-ins and this tool. Resolved via
+ * pi's `getAgentDir()` so `PI_CODING_AGENT_DIR` overrides are honored.
+ */
+function getBinDir(): string {
+	return join(getAgentDir(), "bin");
+}
+
+/** Offline opt-out, mirroring pi's own `PI_OFFLINE` handling. */
+function isOfflineModeEnabled(): boolean {
+	const value = process.env.PI_OFFLINE;
+	if (!value) return false;
+	const lower = value.toLowerCase();
+	return value === "1" || lower === "true" || lower === "yes";
+}
+
+function rgBinaryName(): string {
+	return isWindows() ? "rg.exe" : "rg";
+}
+
+/** Probe PATH by actually executing the command (a missing binary sets `error`). */
+function executableWorks(command: string): boolean {
+	try {
+		const result = spawnSync(command, ["--version"], {
+			stdio: "pipe",
+			windowsHide: true,
+		});
+		return result.error === undefined || result.error === null;
+	} catch {
+		return false;
+	}
+}
+
+/** Resolve the latest release tag from the redirect, avoiding the API quota. */
+async function resolveLatestRipgrepVersion(): Promise<string> {
+	const response = await fetch(
+		`https://github.com/${RIPGREP_REPO}/releases/latest`,
+		{
+			headers: { "User-Agent": RIPGREP_USER_AGENT },
+			redirect: "manual",
+			signal: AbortSignal.timeout(RIPGREP_VERSION_TIMEOUT_MS),
+		},
+	);
+	// Only the status and headers matter; discard the body to reuse the socket.
+	try {
+		await response.body?.cancel();
+	} catch {
+		// Best-effort.
+	}
+	const location =
+		response.status >= 300 && response.status < 400
+			? response.headers.get("location")
+			: null;
+	if (!location) {
+		throw new Error(
+			`failed to resolve the latest ripgrep release (HTTP ${response.status} without a redirect)`,
+		);
+	}
+	const tag = new URL(location, "https://github.com").pathname.split("/").pop();
+	if (!tag || !location.includes("/releases/tag/")) {
+		throw new Error(
+			`failed to resolve the latest ripgrep release (unexpected redirect to ${location})`,
+		);
+	}
+	return decodeURIComponent(tag).replace(/^v/, "");
+}
+
+/** Official release asset for this platform/arch, or `null` when unavailable. */
+function ripgrepAssetName(
+	version: string,
+	plat: string = platform(),
+	architecture: string = arch(),
+): string | null {
+	const rustArch =
+		architecture === "x64"
+			? "x86_64"
+			: architecture === "arm64"
+				? "aarch64"
+				: architecture === "ia32"
+					? "i686"
+					: architecture === "arm"
+						? "armv7"
+						: null;
+	if (!rustArch) return null;
+	if (plat === "darwin") {
+		// Only x64/arm64 builds are published for macOS.
+		if (architecture !== "x64" && architecture !== "arm64") return null;
+		return `ripgrep-${version}-${rustArch}-apple-darwin.tar.gz`;
+	}
+	if (plat === "linux") {
+		// musl builds are static, so they work on any glibc/musl distro.
+		if (architecture === "x64" || architecture === "arm64") {
+			return `ripgrep-${version}-${rustArch}-unknown-linux-musl.tar.gz`;
+		}
+		if (architecture === "arm") {
+			return `ripgrep-${version}-armv7-unknown-linux-musleabihf.tar.gz`;
+		}
+		return null;
+	}
+	if (plat === "win32") {
+		if (
+			architecture === "x64" ||
+			architecture === "arm64" ||
+			architecture === "ia32"
+		) {
+			return `ripgrep-${version}-${rustArch}-pc-windows-msvc.zip`;
+		}
+		return null;
+	}
+	return null;
+}
+
+async function downloadFile(url: string, dest: string): Promise<void> {
+	const response = await fetch(url, {
+		redirect: "follow",
+		signal: AbortSignal.timeout(RIPGREP_DOWNLOAD_TIMEOUT_MS),
+	});
+	if (!response.ok) {
+		throw new Error(`download failed with HTTP ${response.status}: ${url}`);
+	}
+	// The release archives are a few MB, so buffering the whole body is fine and
+	// avoids the DOM/node `ReadableStream` type friction of `Readable.fromWeb`.
+	writeFileSync(dest, Buffer.from(await response.arrayBuffer()));
+}
+
+function runExtractionCommand(command: string, args: string[]): string | null {
+	const result = spawnSync(command, args, { stdio: "pipe", windowsHide: true });
+	if (!result.error && result.status === 0) return null;
+	const stderr = result.stderr?.toString().trim();
+	const stdout = result.stdout?.toString().trim();
+	const detail =
+		result.error?.message || stderr || stdout || `exit status ${result.status}`;
+	return `${command}: ${detail}`;
+}
+
+/**
+ * Windows ships bsdtar as `System32\tar.exe`, which reads zip archives — prefer
+ * it over Git Bash's GNU tar, which does not.
+ */
+function getWindowsTarCommand(): string {
+	const systemRoot = process.env.SystemRoot;
+	if (systemRoot) {
+		const systemTar = join(systemRoot, "System32", "tar.exe");
+		if (existsSync(systemTar)) return systemTar;
+	}
+	return "tar.exe";
+}
+
+function extractZipArchive(
+	archivePath: string,
+	extractDir: string,
+	assetName: string,
+): void {
+	const failures: string[] = [];
+	if (isWindows()) {
+		const tarFailure = runExtractionCommand(getWindowsTarCommand(), [
+			"xf",
+			archivePath,
+			"-C",
+			extractDir,
+		]);
+		if (!tarFailure) return;
+		failures.push(tarFailure);
+		const script =
+			"& { param($archive, $destination) $ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force }";
+		const powershellFailure = runExtractionCommand("powershell.exe", [
+			"-NoLogo",
+			"-NoProfile",
+			"-NonInteractive",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-Command",
+			script,
+			archivePath,
+			extractDir,
+		]);
+		if (!powershellFailure) return;
+		failures.push(powershellFailure);
+	} else {
+		const unzipFailure = runExtractionCommand("unzip", [
+			"-q",
+			archivePath,
+			"-d",
+			extractDir,
+		]);
+		if (!unzipFailure) return;
+		failures.push(unzipFailure);
+		const tarFailure = runExtractionCommand("tar", [
+			"xf",
+			archivePath,
+			"-C",
+			extractDir,
+		]);
+		if (!tarFailure) return;
+		failures.push(tarFailure);
+	}
+	throw new Error(`failed to extract ${assetName}: ${failures.join("; ")}`);
+}
+
+function extractTarGzArchive(
+	archivePath: string,
+	extractDir: string,
+	assetName: string,
+): void {
+	const failure = runExtractionCommand("tar", [
+		"xzf",
+		archivePath,
+		"-C",
+		extractDir,
+	]);
+	if (failure) throw new Error(`failed to extract ${assetName}: ${failure}`);
+}
+
+function findBinaryRecursively(
+	rootDir: string,
+	binaryFileName: string,
+): string | null {
+	const stack = [rootDir];
+	while (stack.length > 0) {
+		const currentDir = stack.pop();
+		if (!currentDir) continue;
+		const entries = readdirSync(currentDir, { withFileTypes: true });
+		for (const entry of entries) {
+			const fullPath = join(currentDir, entry.name);
+			if (entry.isFile() && entry.name === binaryFileName) return fullPath;
+			if (entry.isDirectory()) stack.push(fullPath);
+		}
+	}
+	return null;
+}
+
+/**
+ * Download the official ripgrep release and install the binary into
+ * `~/.pi/agent/bin` (the directory pi's own tools-manager reads from).
+ */
+async function downloadRipgrep(): Promise<string> {
+	const version = await resolveLatestRipgrepVersion();
+	const assetName = ripgrepAssetName(version);
+	if (!assetName) {
+		throw new Error(`no official ripgrep release for ${platform()}/${arch()}`);
+	}
+
+	const binDir = getBinDir();
+	mkdirSync(binDir, { recursive: true });
+
+	const binaryName = rgBinaryName();
+	const binaryPath = join(binDir, binaryName);
+	const archivePath = join(binDir, assetName);
+	const downloadUrl = `https://github.com/${RIPGREP_REPO}/releases/download/${version}/${assetName}`;
+
+	await downloadFile(downloadUrl, archivePath);
+
+	// Extract into a unique temp dir: parallel tool calls can both reach here
+	// (the promise cache only dedupes within one process run).
+	const extractDir = join(
+		binDir,
+		`extract_tmp_rg_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+	);
+	mkdirSync(extractDir, { recursive: true });
+	try {
+		if (assetName.endsWith(".tar.gz")) {
+			extractTarGzArchive(archivePath, extractDir, assetName);
+		} else if (assetName.endsWith(".zip")) {
+			extractZipArchive(archivePath, extractDir, assetName);
+		} else {
+			throw new Error(`unsupported archive format: ${assetName}`);
+		}
+
+		// Archives nest the binary under a versioned directory in some releases
+		// and place it at the root in others.
+		const extractedDir = join(
+			extractDir,
+			assetName.replace(/\.(tar\.gz|zip)$/, ""),
+		);
+		let extractedBinary = [
+			join(extractedDir, binaryName),
+			join(extractDir, binaryName),
+		].find((candidate) => existsSync(candidate));
+		if (!extractedBinary) {
+			extractedBinary =
+				findBinaryRecursively(extractDir, binaryName) ?? undefined;
+		}
+		if (!extractedBinary) {
+			throw new Error(`binary ${binaryName} not found in ${assetName}`);
+		}
+
+		// rename() replaces an existing target on POSIX; on Windows it fails if
+		// the file is locked (rg running), so fall back to an in-place write.
+		try {
+			renameSync(extractedBinary, binaryPath);
+		} catch {
+			copyFileSync(extractedBinary, binaryPath);
+		}
+		if (!isWindows()) chmodSync(binaryPath, 0o755);
+	} finally {
+		rmSync(archivePath, { force: true });
+		rmSync(extractDir, { recursive: true, force: true });
+	}
+
+	return binaryPath;
+}
+
+async function resolveRipgrepBinary(
+	notify?: (message: string) => void,
+): Promise<string> {
+	const override = process.env.PICC_GREP_RG_PATH;
+	if (override) {
+		if (!existsSync(override)) {
+			throw new Error(
+				`PICC_GREP_RG_PATH is set to ${override}, but no file exists there`,
+			);
+		}
+		return override;
+	}
+
+	// Prefer the shared pi bin dir, then PATH, then download. A present-but-broken
+	// binary (truncated download, wrong architecture) is treated as missing so the
+	// next branch — or a fresh download — can take over, instead of failing every
+	// search until the user deletes the file by hand.
+	const localPath = join(getBinDir(), rgBinaryName());
+	if (existsSync(localPath) && executableWorks(localPath)) return localPath;
+	if (executableWorks("rg")) return "rg";
+
+	if (isOfflineModeEnabled()) {
+		throw new Error(
+			"ripgrep (rg) not found and PI_OFFLINE is set, so it will not be downloaded. Install ripgrep or set PICC_GREP_RG_PATH.",
+		);
+	}
+	// Linux binaries cannot run on Android (Bionic libc); Termux must use pkg.
+	if (platform() === "android") {
+		throw new Error(
+			"ripgrep (rg) not found. Install it with: pkg install ripgrep",
+		);
+	}
+
+	notify?.("ripgrep (rg) not found — downloading...");
+	try {
+		const installedPath = await downloadRipgrep();
+		notify?.(`ripgrep installed to ${installedPath}`);
+		return installedPath;
+	} catch (err) {
+		// Include the cause chain: a `fetch failed` hides DNS/TLS/timeout detail.
+		const messages: string[] = [];
+		for (
+			let current: unknown = err, depth = 0;
+			current instanceof Error && depth < 5;
+			current = current.cause, depth++
+		) {
+			if (!messages.includes(current.message)) messages.push(current.message);
+		}
+		const detail = messages.length > 0 ? messages.join(": ") : String(err);
+		throw new Error(
+			`ripgrep (rg) not found and automatic download failed (${detail}). Install ripgrep or set PICC_GREP_RG_PATH.`,
+		);
+	}
+}
+
+/**
+ * Process-wide memo for the resolved `rg` path, so the (potentially slow)
+ * download runs once even when parallel tool calls race.
+ */
+let ripgrepPathPromise: Promise<string> | undefined;
+
+let resolvedRipgrepPath: string | undefined;
+
+function getRipgrepPath(notify?: (message: string) => void): Promise<string> {
+	if (resolvedRipgrepPath) return Promise.resolve(resolvedRipgrepPath);
+	if (!ripgrepPathPromise) {
+		ripgrepPathPromise = resolveRipgrepBinary(notify)
+			.then((resolved) => {
+				resolvedRipgrepPath = resolved;
+				return resolved;
+			})
+			.catch((err: unknown) => {
+				// Do not cache failures — a later call may succeed (e.g. the user
+				// installed rg, or the network came back).
+				ripgrepPathPromise = undefined;
+				throw err;
+			});
+	}
+	return ripgrepPathPromise;
+}
+
+/** Forget the memoized path so the next call re-resolves (e.g. after ENOENT). */
+function invalidateRipgrepPath(): void {
+	resolvedRipgrepPath = undefined;
+	ripgrepPathPromise = undefined;
+}
+
+// ============================================================================
 // Ripgrep execution
 // ============================================================================
 
@@ -298,8 +716,11 @@ interface RipgrepOutcome {
  * Run a single ripgrep invocation, resolving with its outcome. Handles the
  * timeout (SIGTERM→SIGKILL on POSIX; default on Windows) and abort signal.
  * `singleThread` prepends `-j 1` (used for the EAGAIN retry).
+ * `rgPath` comes from `getRipgrepPath()` — an absolute path when downloaded,
+ * the bare `rg` command when found on PATH.
  */
 function runRipgrepOnce(
+	rgPath: string,
 	args: string[],
 	target: string,
 	abortSignal: AbortSignal,
@@ -310,7 +731,7 @@ function runRipgrepOnce(
 		const threadArgs = singleThread ? ["-j", "1"] : [];
 		const fullArgs = [...threadArgs, ...args, target];
 
-		const child = spawn("rg", fullArgs, {
+		const child = spawn(rgPath, fullArgs, {
 			signal: abortSignal,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
@@ -403,22 +824,44 @@ function parseLines(stdout: string): string[] {
  * Run ripgrep with Claude Code's semantics: retry once on EAGAIN with
  * `-j 1`, treat exit 1 as "no matches", and throw a descriptive error when a
  * timeout yields zero results.
+ *
+ * The `rg` binary is resolved (and, when missing, downloaded) before the first
+ * spawn. A spawn ENOENT — the resolved path vanished underneath us — drops the
+ * memoized path and retries once so the next attempt re-resolves/downloads.
  */
 async function ripGrep(
 	args: string[],
 	target: string,
 	abortSignal: AbortSignal,
+	notify?: (message: string) => void,
 ): Promise<string[]> {
 	const timeoutMs = isWsl() ? 60_000 : 20_000;
 
-	const run = async (singleThread: boolean): Promise<RipgrepOutcome> =>
-		runRipgrepOnce(args, target, abortSignal, timeoutMs, singleThread);
+	const run = async (
+		rgPath: string,
+		singleThread: boolean,
+	): Promise<RipgrepOutcome> =>
+		runRipgrepOnce(rgPath, args, target, abortSignal, timeoutMs, singleThread);
 
-	let result = await run(false);
+	let rgPath = await getRipgrepPath(notify);
+
+	let result = await run(rgPath, false);
+
+	// The memoized binary disappeared (uninstalled, bin dir cleaned). Re-resolve
+	// once — this also re-downloads when there is no fallback on PATH.
+	if (
+		result.error !== null &&
+		/ENOENT|not found/i.test(result.error) &&
+		result.lines.length === 0
+	) {
+		invalidateRipgrepPath();
+		rgPath = await getRipgrepPath(notify);
+		result = await run(rgPath, false);
+	}
 
 	// EAGAIN (resource-constrained envs): retry once, single-threaded.
 	if (result.error !== null && isEagainError(result.stderr)) {
-		result = await run(true);
+		result = await run(rgPath, true);
 	}
 
 	if (result.error === null) return result.lines;
@@ -920,6 +1363,7 @@ async function executeGrep(
 	params: GrepParams,
 	cwd: string,
 	signal: AbortSignal | undefined,
+	notify?: (message: string) => void,
 ): Promise<string> {
 	const abort = signal ?? new AbortController().signal;
 	const output_mode = params.output_mode ?? "files_with_matches";
@@ -955,7 +1399,7 @@ async function executeGrep(
 	}
 
 	const args = buildRipgrepArgs(params);
-	const raw = await ripGrep(args, dir, abort);
+	const raw = await ripGrep(args, dir, abort, notify);
 
 	switch (output_mode) {
 		case "content":
@@ -995,11 +1439,25 @@ export default function (pi: ExtensionAPI): void {
 			_toolCallId,
 			params,
 			signal,
-			_onUpdate,
+			onUpdate,
 			ctx: ExtensionContext,
 		) {
+			// Surface the one-time ripgrep download instead of appearing hung: the
+			// message goes to the footer status line and as a partial result.
+			const notify = (message: string) => {
+				onUpdate?.({
+					content: [{ type: "text", text: message }],
+					details: { notice: message },
+				});
+				ctx.ui.setStatus("picc-grep", message);
+			};
 			try {
-				const text = await executeGrep(params as GrepParams, ctx.cwd, signal);
+				const text = await executeGrep(
+					params as GrepParams,
+					ctx.cwd,
+					signal,
+					notify,
+				);
 				return {
 					content: [{ type: "text", text }],
 					details: {
@@ -1018,11 +1476,25 @@ export default function (pi: ExtensionAPI): void {
 				// prefix the model previously saw.
 				const message = err instanceof Error ? err.message : String(err);
 				throw new Error(`Grep search failed: ${message}`);
+			} finally {
+				ctx.ui.setStatus("picc-grep", undefined);
 			}
 		},
 		renderResult(result, { isPartial }, theme, context) {
+			const partialText = isPartial
+				? result.content
+						.filter(
+							(c): c is { type: "text"; text: string } => c.type === "text",
+						)
+						.map((c) => c.text)
+						.join("\n")
+				: "";
 			if (isPartial) {
-				return new Text(theme.fg("warning", "Searching..."), 0, 0);
+				return new Text(
+					theme.fg("warning", partialText || "Searching..."),
+					0,
+					0,
+				);
 			}
 			const t =
 				(context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
